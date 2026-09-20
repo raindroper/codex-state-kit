@@ -4,7 +4,7 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode, Uri, Version};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -18,7 +18,7 @@ use url::Url;
 use crate::attach::{self, is_attached};
 use crate::fetch;
 use crate::login::{self, has_chatgpt_login};
-use crate::logs::{self, LogEntry, NetworkLogDetails};
+use crate::logs::{self, LogEntry, NetworkLogDetails, ObservedStream, StreamLifecycle};
 use crate::settings::{save_settings, OutboundMode, Settings, SettingsPatch};
 use crate::turn_state::{self, TurnStateStore, TurnStateView};
 use crate::warp::{WarpRuntime, WarpStatus};
@@ -46,7 +46,9 @@ enum FetchRetryClass {
     Normal,
     Backoff,
     Auth,
+    Forbidden,
     Stale,
+    Deferred,
 }
 
 #[derive(Debug)]
@@ -77,13 +79,16 @@ fn fetch_retry_delay(class: FetchRetryClass) -> Duration {
         FetchRetryClass::Normal => fetch::RETRY_INTERVAL,
         FetchRetryClass::Backoff => fetch::ERROR_BACKOFF,
         FetchRetryClass::Auth => fetch::AUTH_BACKOFF,
+        FetchRetryClass::Forbidden => fetch::FORBIDDEN_BACKOFF,
         FetchRetryClass::Stale => fetch::RETRY_INTERVAL,
+        FetchRetryClass::Deferred => fetch::RETRY_INTERVAL,
     }
 }
 
 fn classify_fetch_failure(details: &NetworkLogDetails) -> FetchRetryClass {
     match details.response_status {
-        Some(401 | 403) => FetchRetryClass::Auth,
+        Some(401) => FetchRetryClass::Auth,
+        Some(403) => FetchRetryClass::Forbidden,
         Some(429 | 503) => FetchRetryClass::Backoff,
         _ if details.error_kind.as_deref() == Some("connect") => FetchRetryClass::Backoff,
         _ => FetchRetryClass::Normal,
@@ -104,6 +109,13 @@ fn capture_fetched_ticket(store: &mut TurnStateStore, model: &str, token: &str) 
     token.trim().len() == store.bound_len_for(model)
         && store.peek_for_model(model).as_deref() == Some(token.trim())
         && !store.needs_refresh(model)
+}
+
+fn degraded_response_model<'a>(
+    request_model: Option<&'a str>,
+    upstream_token: Option<&str>,
+) -> Option<&'a str> {
+    request_model.filter(|_| upstream_token.is_some_and(turn_state::is_degraded_token))
 }
 
 const HOP_BY_HOP: &[&str] = &[
@@ -155,6 +167,7 @@ pub struct App {
     fetch_round: AtomicU32,
     fetch_gate: Mutex<()>,
     fetch_next_allowed_at: Mutex<Instant>,
+    fetch_model_next_allowed_at: Mutex<HashMap<String, Instant>>,
     fetch_generation: AtomicU64,
     fetch_change_notify: Notify,
     fetch_transition: Mutex<()>,
@@ -190,6 +203,7 @@ impl App {
             fetch_round: AtomicU32::new(0),
             fetch_gate: Mutex::new(()),
             fetch_next_allowed_at: Mutex::new(Instant::now()),
+            fetch_model_next_allowed_at: Mutex::new(HashMap::new()),
             fetch_generation: AtomicU64::new(0),
             fetch_change_notify: Notify::new(),
             fetch_transition: Mutex::new(()),
@@ -204,36 +218,101 @@ impl App {
         })
     }
 
-    async fn sync_logged_in_account(&self) {
+    async fn sync_request_identity(
+        &self,
+        home: &Path,
+    ) -> Option<(login::ChatGptCredentials, bool)> {
         let _transition = self.fetch_transition.lock().await;
-        let home = self.settings.lock().await.codex_home.clone();
-        let Ok(creds) = login::chatgpt_credentials(Path::new(&home)) else {
-            return;
-        };
+        let mut identity = login::request_credentials(home).ok()?;
         let needs_change = !self
             .turn_state
             .lock()
             .await
-            .is_bound_to_account(&creds.account_id);
+            .is_bound_to_account(&identity.0.account_id);
         if !needs_change {
-            return;
+            return Some(identity);
         }
-        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        self.fetch_change_notify.notify_waiters();
+
+        // Wait for an in-flight probe, then read credentials again while the
+        // transition lock prevents another account/config switch. The same
+        // snapshot is returned for request authentication and ticket lookup.
         let _gate = self.fetch_gate.lock().await;
-        self.turn_state.lock().await.bind_account(&creds.account_id);
-        self.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        self.seeds_registered.store(false, Ordering::Relaxed);
-        *self.fetch_error.lock().await = None;
-        *self.fetch_ok_at.lock().await = None;
-        *self.fetch_next_allowed_at.lock().await = Instant::now();
-        self.model_notify.notify_one();
+        identity = login::request_credentials(home).ok()?;
+        let needs_change = !self
+            .turn_state
+            .lock()
+            .await
+            .is_bound_to_account(&identity.0.account_id);
+        if needs_change {
+            self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+            self.fetch_change_notify.notify_waiters();
+            self.turn_state
+                .lock()
+                .await
+                .bind_account(&identity.0.account_id);
+            self.fetch_generation.fetch_add(1, Ordering::SeqCst);
+            self.seeds_registered.store(false, Ordering::Relaxed);
+            *self.fetch_error.lock().await = None;
+            *self.fetch_ok_at.lock().await = None;
+            self.reset_fetch_schedule().await;
+            self.fetch_change_notify.notify_waiters();
+            self.model_notify.notify_one();
+        }
+        Some(identity)
+    }
+
+    async fn sync_logged_in_account(&self) {
+        let home = self.settings.lock().await.codex_home.clone();
+        let _ = self.sync_request_identity(Path::new(&home)).await;
+    }
+
+    async fn handle_degraded_response(
+        &self,
+        model: &str,
+        creds: &login::ChatGptCredentials,
+        request_account_matches: bool,
+        injected_token: Option<&str>,
+    ) -> bool {
+        let Some(injected_token) = injected_token.map(str::trim).filter(|value| !value.is_empty())
+        else {
+            return false;
+        };
+        let invalidated = {
+            let mut store = self.turn_state.lock().await;
+            let current_matches = store.peek_for_model(model).as_deref() == Some(injected_token);
+            if request_account_matches
+                && current_matches
+                && store.is_bound_to_account(&creds.account_id)
+            {
+                store.invalidate_model(model);
+                true
+            } else {
+                false
+            }
+        };
+        if invalidated {
+            self.clear_model_fetch_delay(model).await;
+            *self.fetch_error.lock().await =
+                Some(format!("[{model}] 业务响应返回 312，已清除旧票据并重新获取"));
+            self.model_notify.notify_one();
+            debug_log(&format!(
+                "[degraded] [{}] 业务响应返回 312，清除该模型票据并唤醒获取",
+                model
+            ));
+        }
+        invalidated
     }
 
     pub async fn status(&self) -> Status {
         self.sync_logged_in_account().await;
         let settings = self.settings.lock().await.clone();
-        let logs = self.logs.lock().await.iter().cloned().collect();
+        let logs = self
+            .logs
+            .lock()
+            .await
+            .iter()
+            .map(LogEntry::snapshot)
+            .collect();
         let attached = is_attached(
             Path::new(&settings.codex_home),
             &format!("http://{}", settings.proxy_listen),
@@ -272,11 +351,22 @@ impl App {
             self.turn_state.lock().await.register_model(&model);
             models.push(model);
         }
+        let mut first_error = None;
         for model in &models {
             if let Err(e) = self.fetch_once(model).await {
                 eprintln!("[refresh] 模型 {} 获取失败: {e}", model);
-                return Err(e.into());
+                let can_try_other_model =
+                    matches!(e.retry, FetchRetryClass::Forbidden | FetchRetryClass::Deferred);
+                if !can_try_other_model {
+                    return Err(e.into());
+                }
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
             }
+        }
+        if let Some(err) = first_error {
+            return Err(err.into());
         }
         Ok(self.status().await)
     }
@@ -292,7 +382,7 @@ impl App {
             store.set_bound_len(len);
         }
         self.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        *self.fetch_next_allowed_at.lock().await = Instant::now();
+        self.reset_fetch_schedule().await;
         self.fetch_change_notify.notify_waiters();
         drop(_gate);
         drop(_transition);
@@ -310,7 +400,7 @@ impl App {
             store.set_model_bound_len(model, len);
         }
         self.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        *self.fetch_next_allowed_at.lock().await = Instant::now();
+        self.reset_fetch_schedule().await;
         self.fetch_change_notify.notify_waiters();
         drop(_gate);
         drop(_transition);
@@ -355,6 +445,74 @@ impl App {
         *self.fetch_next_allowed_at.lock().await = Instant::now() + delay;
     }
 
+    async fn reset_fetch_schedule(&self) {
+        *self.fetch_next_allowed_at.lock().await = Instant::now();
+        self.fetch_model_next_allowed_at.lock().await.clear();
+    }
+
+    async fn defer_fetch_failure(&self, model: &str, class: FetchRetryClass) {
+        if matches!(class, FetchRetryClass::Stale | FetchRetryClass::Deferred) {
+            return;
+        }
+        if class == FetchRetryClass::Forbidden {
+            self.defer_next_fetch(fetch::RETRY_INTERVAL).await;
+            self.fetch_model_next_allowed_at
+                .lock()
+                .await
+                .insert(model.to_string(), Instant::now() + fetch_retry_delay(class));
+        } else {
+            self.defer_next_fetch(fetch_retry_delay(class)).await;
+        }
+    }
+
+    async fn clear_model_fetch_delay(&self, model: &str) {
+        self.fetch_model_next_allowed_at.lock().await.remove(model);
+    }
+
+    async fn model_fetch_wait(&self, model: &str) -> Duration {
+        let now = Instant::now();
+        let mut deadlines = self.fetch_model_next_allowed_at.lock().await;
+        match deadlines.get(model).copied() {
+            Some(deadline) if deadline > now => deadline.duration_since(now),
+            Some(_) => {
+                deadlines.remove(model);
+                Duration::ZERO
+            }
+            None => Duration::ZERO,
+        }
+    }
+
+    async fn eligible_fetch_models(&self, models: &[String]) -> (Vec<String>, Duration) {
+        let now = Instant::now();
+        let global_wait = self
+            .fetch_next_allowed_at
+            .lock()
+            .await
+            .saturating_duration_since(now);
+        let mut deadlines = self.fetch_model_next_allowed_at.lock().await;
+        deadlines.retain(|_, deadline| *deadline > now);
+
+        let eligible: Vec<String> = models
+            .iter()
+            .filter(|model| !deadlines.contains_key(model.as_str()))
+            .cloned()
+            .collect();
+        if !eligible.is_empty() {
+            return (eligible, global_wait);
+        }
+
+        let model_wait = models
+            .iter()
+            .filter_map(|model| deadlines.get(model.as_str()))
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .min()
+            .unwrap_or(fetch::CHECK_INTERVAL);
+        // Re-evaluate all active models periodically while every currently
+        // stale model is cooling. A different model may enter its prefetch
+        // window before this model's (notably 403) cooldown expires.
+        (eligible, global_wait.max(model_wait.min(fetch::CHECK_INTERVAL)))
+    }
+
     async fn fetch_once(&self, model: &str) -> std::result::Result<String, FetchOnceError> {
         let _gate = self.fetch_gate.lock().await;
         let generation = self.fetch_generation.load(Ordering::SeqCst);
@@ -364,19 +522,31 @@ impl App {
                 FetchRetryClass::Normal,
             ));
         }
+        let model_wait = self.model_fetch_wait(model).await;
+        if !model_wait.is_zero() {
+            return Err(FetchOnceError::new(
+                format!(
+                    "[{model}] 票据获取仍在独立冷却中（剩余约 {} 秒）",
+                    model_wait.as_secs().saturating_add(1)
+                ),
+                FetchRetryClass::Deferred,
+            ));
+        }
         let saved = self.settings.lock().await.clone();
         let settings = match self.fetch_settings(&saved) {
             Ok(settings) => settings,
             Err(err) => {
                 let message = err.to_string();
-                self.defer_next_fetch(fetch::ERROR_BACKOFF).await;
+                self.defer_fetch_failure(model, FetchRetryClass::Backoff)
+                    .await;
                 *self.fetch_error.lock().await = Some(message.clone());
                 return Err(FetchOnceError::new(message, FetchRetryClass::Backoff));
             }
         };
         if !has_chatgpt_login(Path::new(&settings.codex_home)) {
             let message = "尚未登录 ChatGPT".to_string();
-            self.defer_next_fetch(fetch::AUTH_BACKOFF).await;
+            self.defer_fetch_failure(model, FetchRetryClass::Auth)
+                .await;
             *self.fetch_error.lock().await = Some(message.clone());
             return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
         }
@@ -384,7 +554,8 @@ impl App {
             Ok(creds) => creds,
             Err(err) => {
                 let message = format!("{err:#}");
-                self.defer_next_fetch(fetch::AUTH_BACKOFF).await;
+                self.defer_fetch_failure(model, FetchRetryClass::Auth)
+                    .await;
                 *self.fetch_error.lock().await = Some(message.clone());
                 return Err(FetchOnceError::new(message, FetchRetryClass::Auth));
             }
@@ -413,7 +584,8 @@ impl App {
                 Ok(client) => client,
                 Err(err) => {
                     let message = format!("{err:#}");
-                    self.defer_next_fetch(fetch::ERROR_BACKOFF).await;
+                    self.defer_fetch_failure(model, FetchRetryClass::Backoff)
+                        .await;
                     *self.fetch_error.lock().await = Some(message.clone());
                     return Err(FetchOnceError::new(message, FetchRetryClass::Backoff));
                 }
@@ -464,6 +636,8 @@ impl App {
                     };
                     self.defer_next_fetch(fetch::RETRY_INTERVAL).await;
                     if !ready {
+                        self.defer_fetch_failure(model, FetchRetryClass::Normal)
+                            .await;
                         details.turn_state_action = "pooled_unmatched".into();
                         self.record_fetch(started, details).await;
                         let message = format!(
@@ -475,6 +649,7 @@ impl App {
                     }
                     details.turn_state_action = "captured".into();
                     self.record_fetch(started, details).await;
+                    self.clear_model_fetch_delay(model).await;
                     *self.fetch_error.lock().await = None;
                     *self.fetch_ok_at.lock().await = Some(
                         chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -511,7 +686,7 @@ impl App {
                     } else {
                         retry_class
                     };
-                    self.defer_next_fetch(fetch_retry_delay(final_class)).await;
+                    self.defer_fetch_failure(model, final_class).await;
                     return Err(FetchOnceError::new(message, final_class));
                 }
             }
@@ -565,9 +740,14 @@ impl App {
             return fetch::CHECK_INTERVAL;
         }
 
+        let (eligible_models, wait) = self.eligible_fetch_models(&models_needing_refresh).await;
+        if eligible_models.is_empty() {
+            return wait;
+        }
+
         let round = self.fetch_round.fetch_add(1, Ordering::Relaxed) + 1;
-        let model = model_for_fetch_round(&models_needing_refresh, round)
-            .expect("models_needing_refresh is not empty");
+        let model = model_for_fetch_round(&eligible_models, round)
+            .expect("eligible_models is not empty");
         let bound_len = self.turn_state.lock().await.bound_len_for(model);
         *self.fetch_error.lock().await = Some(format!(
             "正在单发获取 {} 的 {} Token（第 {} 轮）…",
@@ -600,7 +780,8 @@ impl App {
                 if err.retry != FetchRetryClass::Stale {
                     *self.fetch_error.lock().await = Some(message.clone());
                 }
-                fetch_retry_delay(err.retry)
+                let (_, wait) = self.eligible_fetch_models(&models_needing_refresh).await;
+                wait
             }
         }
     }
@@ -870,7 +1051,7 @@ impl ProxyHandle {
         }
         if route_changed {
             self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-            *self.app.fetch_next_allowed_at.lock().await = Instant::now();
+            self.app.reset_fetch_schedule().await;
             self.app.fetch_change_notify.notify_waiters();
             drop(fetch_change_guard.take());
             drop(fetch_transition_guard.take());
@@ -935,7 +1116,7 @@ impl ProxyHandle {
             .connect(accept_terms, settings.warp_http2)
             .await;
         self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        *self.app.fetch_next_allowed_at.lock().await = Instant::now();
+        self.app.reset_fetch_schedule().await;
         self.app.fetch_change_notify.notify_waiters();
         *self.app.fetch_error.lock().await = None;
         *self.app.fetch_ok_at.lock().await = None;
@@ -955,7 +1136,7 @@ impl ProxyHandle {
         let fetch_change = self.app.fetch_gate.lock().await;
         self.app.warp.stop().await;
         self.app.fetch_generation.fetch_add(1, Ordering::SeqCst);
-        *self.app.fetch_next_allowed_at.lock().await = Instant::now();
+        self.app.reset_fetch_schedule().await;
         self.app.fetch_change_notify.notify_waiters();
         *self.app.fetch_error.lock().await = None;
         *self.app.fetch_ok_at.lock().await = None;
@@ -1006,7 +1187,7 @@ async fn proxy_http(app: Arc<App>, req: Request<Body>) -> Response {
     let method = req.method().clone();
     let path = logs::safe_text(req.uri().path(), 256);
     let mut details = NetworkLogDetails::default();
-    match forward_http_with_log(&app, req, &mut details).await {
+    match forward_http_with_log(&app, req, &mut details, started).await {
         Ok(resp) => {
             app.record(
                 method.as_str(),
@@ -1044,13 +1225,14 @@ fn upstream_http_client(proxy: &str) -> Result<reqwest::Client> {
 #[cfg(test)]
 async fn forward_http(app: &App, req: Request<Body>) -> Result<Response> {
     let mut details = NetworkLogDetails::default();
-    forward_http_with_log(app, req, &mut details).await
+    forward_http_with_log(app, req, &mut details, Instant::now()).await
 }
 
 async fn forward_http_with_log(
     app: &App,
     req: Request<Body>,
     details: &mut NetworkLogDetails,
+    started: Instant,
 ) -> Result<Response> {
     let (upstream, home, upstream_proxy, http) = {
         let settings = app.settings.lock().await;
@@ -1083,7 +1265,7 @@ async fn forward_http_with_log(
         .headers
         .get(header::ACCEPT)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains("text/event-stream"))
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
     {
         "http_sse".into()
     } else {
@@ -1098,9 +1280,17 @@ async fn forward_http_with_log(
         should_stamp
     ));
 
+    let request_identity = app.sync_request_identity(Path::new(&home)).await;
+    let request_account_matches = request_identity
+        .as_ref()
+        .is_some_and(|(creds, override_headers)| {
+            *override_headers || login::credentials_match_headers(&parts.headers, creds)
+        });
+    let request_model = should_stamp
+        .then(|| turn_state::extract_model_from_body(&bytes))
+        .flatten();
     let mut injected_token: Option<String> = None;
     if should_stamp {
-        let request_model = turn_state::extract_model_from_body(&bytes);
         details.model = request_model
             .as_deref()
             .map(|model| logs::safe_text(model, 80))
@@ -1126,11 +1316,14 @@ async fn forward_http_with_log(
         if client_already_has {
             let store = app.turn_state.lock().await;
             // 严格按模型取 token — 不同模型的 token 不可混用
-            let token = if let Some(ref model) = request_model {
-                store.peek_for_model(model)
-            } else {
-                // 无法识别模型时不注入，保留客户端原 token
-                None
+            let token = match (&request_model, &request_identity) {
+                (Some(model), Some((creds, _)))
+                    if request_account_matches
+                        && store.is_bound_to_account(&creds.account_id) =>
+                {
+                    store.peek_for_model(model)
+                }
+                _ => None,
             };
             if let Some(token) = token {
                 turn_state::apply_http_header(&mut parts.headers, &token);
@@ -1145,10 +1338,10 @@ async fn forward_http_with_log(
                 );
                 injected_token = Some(token);
             } else {
-                details.turn_state_action = if request_model.is_some() {
-                    "preserved_no_ticket".into()
-                } else {
-                    "preserved_unknown_model".into()
+                details.turn_state_action = match (&request_model, request_account_matches) {
+                    (None, _) => "preserved_unknown_model".into(),
+                    (Some(_), false) => "preserved_account_mismatch".into(),
+                    (Some(_), true) => "preserved_no_ticket".into(),
                 };
                 details.turn_state_len = parts
                     .headers
@@ -1172,7 +1365,11 @@ async fn forward_http_with_log(
     } else {
         details.turn_state_action = "not_applicable".into();
     }
-    login::apply_kit_auth_headers(&mut parts.headers, Path::new(&home));
+    if let Some((creds, override_headers)) = &request_identity {
+        if *override_headers {
+            login::apply_chatgpt_credentials_headers(&mut parts.headers, creds);
+        }
+    }
     let mut builder = http
         .request(
             reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?,
@@ -1192,6 +1389,22 @@ async fn forward_http_with_log(
             return Err(error).context("upstream http");
         }
     };
+    let response_header_ms = started.elapsed().as_millis();
+    details.response_header_ms = Some(response_header_ms);
+    if let Some(content_type) = upstream_resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        details.transport = if content_type
+            .to_ascii_lowercase()
+            .contains("text/event-stream")
+        {
+            "http_sse".into()
+        } else {
+            "http".into()
+        };
+    }
     let resp_status_u16 = upstream_resp.status().as_u16();
     details.peer_addr = upstream_resp.remote_addr().map(|addr| addr.to_string());
     details.final_origin = Some(logs::endpoint_origin(upstream_resp.url().as_str()));
@@ -1210,6 +1423,18 @@ async fn forward_http_with_log(
     // 记录上游响应详情，方便排查 token 失效
     let upstream_turn_state = turn_state::header_token(upstream_resp.headers());
     details.returned_turn_state_len = upstream_turn_state.as_ref().map(|token| token.len());
+    if let (Some(model), Some((creds, _))) = (
+        degraded_response_model(request_model.as_deref(), upstream_turn_state.as_deref()),
+        request_identity.as_ref(),
+    ) {
+        app.handle_degraded_response(
+            model,
+            creds,
+            request_account_matches,
+            injected_token.as_deref(),
+        )
+        .await;
+    }
     let injected_len = injected_token.as_ref().map(|t| t.len());
     let upstream_ts_len = upstream_turn_state.as_ref().map(|t| t.len());
     let same_token = match (&injected_token, &upstream_turn_state) {
@@ -1243,8 +1468,16 @@ async fn forward_http_with_log(
             headers.append(n, v);
         }
     }
-    let stream = upstream_resp.bytes_stream();
-    let body = Body::from_stream(stream);
+    let body = if details.transport == "http_sse" {
+        let lifecycle = Arc::new(StreamLifecycle::new(started, response_header_ms));
+        details.stream_lifecycle = Some(lifecycle.clone());
+        Body::from_stream(ObservedStream::new(
+            upstream_resp.bytes_stream(),
+            lifecycle,
+        ))
+    } else {
+        Body::from_stream(upstream_resp.bytes_stream())
+    };
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -1336,21 +1569,216 @@ mod tests {
         assert_eq!(fetch_retry_delay(FetchRetryClass::Normal), fetch::RETRY_INTERVAL);
         assert_eq!(fetch_retry_delay(FetchRetryClass::Backoff), fetch::ERROR_BACKOFF);
         assert_eq!(fetch_retry_delay(FetchRetryClass::Auth), fetch::AUTH_BACKOFF);
+        assert_eq!(
+            fetch_retry_delay(FetchRetryClass::Forbidden),
+            fetch::FORBIDDEN_BACKOFF
+        );
         assert_eq!(fetch_retry_delay(FetchRetryClass::Stale), fetch::RETRY_INTERVAL);
         assert!(fetch::RETRY_INTERVAL >= Duration::from_secs(6));
         assert_eq!(fetch::CONNECT_ATTEMPTS, 4);
         assert!(fetch::CONNECT_RETRY_INTERVAL >= Duration::from_secs(6));
     }
 
+    #[tokio::test]
+    async fn forbidden_model_backoff_does_not_block_a_different_model() {
+        let app = App::new(Settings::default()).unwrap();
+        let forbidden = classify_fetch_failure(&NetworkLogDetails {
+            response_status: Some(403),
+            ..NetworkLogDetails::default()
+        });
+        app.defer_fetch_failure("luna", forbidden).await;
+
+        let models = vec!["astra".to_string(), "luna".to_string()];
+        let (eligible, wait) = app.eligible_fetch_models(&models).await;
+        assert_eq!(eligible, vec!["astra"]);
+        assert!(wait <= fetch::RETRY_INTERVAL);
+
+        // A direct call for the cooled model is rejected before route or
+        // network work and does not clear the other model's eligibility.
+        let err = app.fetch_once("luna").await.unwrap_err();
+        assert_eq!(err.retry, FetchRetryClass::Deferred);
+        let (eligible, _) = app.eligible_fetch_models(&models).await;
+        assert_eq!(eligible, vec!["astra"]);
+    }
+
+    #[tokio::test]
+    async fn request_identity_rebinds_pool_before_header_override() {
+        if std::env::var_os("CSK_IDENTITY_TEST_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proxy::tests::request_identity_rebinds_pool_before_header_override",
+                    "--nocapture",
+                ])
+                .env("CSK_IDENTITY_TEST_CHILD", "1")
+                .env("HOME", dir.path())
+                .env("USERPROFILE", dir.path())
+                .env("APPDATA", dir.path())
+                .env("LOCALAPPDATA", dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+
+        let home = crate::settings::home_dir().join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            login::kit_auth_path(&home),
+            r#"{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "access_token": "new-access",
+    "refresh_token": "new-refresh",
+    "account_id": "new-account"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let app = App::new(Settings {
+            codex_home: home.display().to_string(),
+            ..Settings::default()
+        })
+        .unwrap();
+        {
+            let mut store = app.turn_state.lock().await;
+            store.bind_account("old-account");
+            store.register_model("gpt-6-astra");
+            let old_ticket = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
+            assert!(store.capture("gpt-6-astra", &old_ticket, "test"));
+        }
+
+        let (creds, override_headers) = app.sync_request_identity(&home).await.unwrap();
+        assert!(override_headers);
+        assert_eq!(creds.account_id, "new-account");
+        let current_ticket = ticket_for_len(turn_state::QUALITY_TOKEN_LEN);
+        {
+            let mut store = app.turn_state.lock().await;
+            assert!(store.is_bound_to_account("new-account"));
+            assert!(store.peek_for_model("gpt-6-astra").is_none());
+            store.register_model("gpt-6-astra");
+            assert!(store.capture("gpt-6-astra", &current_ticket, "test"));
+        }
+        assert!(!app
+            .handle_degraded_response("gpt-6-astra", &creds, true, None)
+            .await);
+        assert!(!app
+            .handle_degraded_response("gpt-6-astra", &creds, true, Some("stale-ticket"))
+            .await);
+        assert!(app
+            .turn_state
+            .lock()
+            .await
+            .peek_for_model("gpt-6-astra")
+            .is_some());
+        assert!(app
+            .handle_degraded_response("gpt-6-astra", &creds, true, Some(&current_ticket))
+            .await);
+        assert!(app
+            .turn_state
+            .lock()
+            .await
+            .peek_for_model("gpt-6-astra")
+            .is_none());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer old-access"),
+        );
+        assert!(!login::credentials_match_headers(&headers, &creds));
+        login::apply_chatgpt_credentials_headers(&mut headers, &creds);
+        assert!(login::credentials_match_headers(&headers, &creds));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_and_connect_backoffs_remain_global() {
+        let cases = [
+            NetworkLogDetails {
+                response_status: Some(401),
+                ..NetworkLogDetails::default()
+            },
+            NetworkLogDetails {
+                error_kind: Some("connect".into()),
+                ..NetworkLogDetails::default()
+            },
+        ];
+        for details in cases {
+            let app = App::new(Settings::default()).unwrap();
+            let class = classify_fetch_failure(&details);
+            app.defer_fetch_failure("luna", class).await;
+            let models = vec!["astra".to_string(), "luna".to_string()];
+            let (eligible, wait) = app.eligible_fetch_models(&models).await;
+            assert_eq!(eligible, models);
+            assert!(wait >= fetch_retry_delay(class).saturating_sub(Duration::from_secs(1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn all_model_backoffs_wait_for_the_earliest_deadline() {
+        let app = App::new(Settings::default()).unwrap();
+        let now = Instant::now();
+        {
+            let mut delays = app.fetch_model_next_allowed_at.lock().await;
+            delays.insert("astra".into(), now + Duration::from_millis(80));
+            delays.insert("luna".into(), now + Duration::from_millis(160));
+        }
+        let models = vec!["astra".to_string(), "luna".to_string()];
+        let (eligible, wait) = app.eligible_fetch_models(&models).await;
+        assert!(eligible.is_empty());
+        assert!(wait >= Duration::from_millis(50));
+        assert!(wait <= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn long_model_backoff_still_rechecks_other_models_periodically() {
+        let app = App::new(Settings::default()).unwrap();
+        app.fetch_model_next_allowed_at
+            .lock()
+            .await
+            .insert("luna".into(), Instant::now() + fetch::AUTH_BACKOFF);
+        let (eligible, wait) = app.eligible_fetch_models(&["luna".into()]).await;
+        assert!(eligible.is_empty());
+        assert!(wait <= fetch::CHECK_INTERVAL);
+        assert!(wait >= fetch::CHECK_INTERVAL.saturating_sub(Duration::from_secs(1)));
+    }
+
+    #[tokio::test]
+    async fn resetting_fetch_schedule_clears_model_backoffs() {
+        let app = App::new(Settings::default()).unwrap();
+        app.defer_fetch_failure("luna", FetchRetryClass::Forbidden)
+            .await;
+        app.reset_fetch_schedule().await;
+        let models = vec!["astra".to_string(), "luna".to_string()];
+        let (eligible, _) = app.eligible_fetch_models(&models).await;
+        assert_eq!(eligible, models);
+    }
+
     #[test]
     fn fetch_failure_class_uses_structured_status_and_error_kind() {
-        for status in [401, 403] {
-            let details = NetworkLogDetails {
-                response_status: Some(status),
-                ..NetworkLogDetails::default()
-            };
-            assert_eq!(classify_fetch_failure(&details), FetchRetryClass::Auth);
-        }
+        let unauthorized = NetworkLogDetails {
+            response_status: Some(401),
+            ..NetworkLogDetails::default()
+        };
+        assert_eq!(
+            classify_fetch_failure(&unauthorized),
+            FetchRetryClass::Auth
+        );
+        let forbidden = NetworkLogDetails {
+            response_status: Some(403),
+            ..NetworkLogDetails::default()
+        };
+        assert_eq!(
+            classify_fetch_failure(&forbidden),
+            FetchRetryClass::Forbidden
+        );
         for status in [429, 503] {
             let details = NetworkLogDetails {
                 response_status: Some(status),
@@ -1367,6 +1795,22 @@ mod tests {
             classify_fetch_failure(&NetworkLogDetails::default()),
             FetchRetryClass::Normal
         );
+    }
+
+    #[test]
+    fn degraded_response_requires_a_model_and_degraded_length_ticket() {
+        let degraded = format!("gAAAAA{}", "x".repeat(turn_state::DEGRADED_TOKEN_LEN - 6));
+        let quality = format!("gAAAAA{}", "x".repeat(turn_state::QUALITY_TOKEN_LEN - 6));
+        assert_eq!(
+            degraded_response_model(Some("gpt-6-astra"), Some(&degraded)),
+            Some("gpt-6-astra")
+        );
+        assert_eq!(
+            degraded_response_model(Some("gpt-6-astra"), Some(&quality)),
+            None
+        );
+        assert_eq!(degraded_response_model(None, Some(&degraded)), None);
+        assert_eq!(degraded_response_model(Some("gpt-6-astra"), None), None);
     }
 
     #[test]

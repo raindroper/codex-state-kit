@@ -252,14 +252,18 @@ pub(crate) struct ChatGptCredentials {
     pub account_id: String,
 }
 
-pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
+pub(crate) fn request_credentials(home: &Path) -> Result<(ChatGptCredentials, bool)> {
     if let Some(creds) = credentials_from_file(&kit_auth_path(home))? {
-        return Ok(creds);
+        return Ok((creds, true));
     }
     if let Some(creds) = credentials_from_file(&official_auth_path(home))? {
-        return Ok(creds);
+        return Ok((creds, false));
     }
     bail!("尚未登录 ChatGPT。请先在本应用完成 ChatGPT 登录。");
+}
+
+pub(crate) fn chatgpt_credentials(home: &Path) -> Result<ChatGptCredentials> {
+    request_credentials(home).map(|(creds, _)| creds)
 }
 
 fn credentials_from_file(path: &Path) -> Result<Option<ChatGptCredentials>> {
@@ -301,14 +305,10 @@ fn credentials_from_auth(auth: &Value) -> Result<ChatGptCredentials> {
     })
 }
 
-/// Kit 已独立登录时，用 Kit 账号替换转发请求上的鉴权头，官方客户端无需重启。
-pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) {
-    if !has_kit_session(home) {
-        return;
-    }
-    let Ok(creds) = chatgpt_credentials(home) else {
-        return;
-    };
+pub(crate) fn apply_chatgpt_credentials_headers(
+    headers: &mut HeaderMap,
+    creds: &ChatGptCredentials,
+) {
     if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", creds.access_token)) {
         headers.insert(http::header::AUTHORIZATION, value);
     }
@@ -316,6 +316,37 @@ pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) {
         headers.insert(HeaderName::from_static("chatgpt-account-id"), value);
     }
     headers.remove(http::header::COOKIE);
+}
+
+pub(crate) fn credentials_match_headers(
+    headers: &HeaderMap,
+    creds: &ChatGptCredentials,
+) -> bool {
+    let account_match = headers
+        .get("chatgpt-account-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim() == creds.account_id);
+    let authorization_match = headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value.split_once(' ').is_some_and(|(scheme, token)| {
+                scheme.eq_ignore_ascii_case("bearer") && token.trim() == creds.access_token
+            })
+        });
+    match account_match {
+        Some(false) => false,
+        Some(true) => authorization_match.unwrap_or(true),
+        None => authorization_match.unwrap_or(false),
+    }
+}
+
+/// Kit 已独立登录时，用 Kit 账号替换转发请求上的鉴权头，官方客户端无需重启。
+pub fn apply_kit_auth_headers(headers: &mut HeaderMap, home: &Path) {
+    let Ok((creds, true)) = request_credentials(home) else {
+        return;
+    };
+    apply_chatgpt_credentials_headers(headers, &creds);
 }
 
 pub async fn start_device_login(
@@ -972,6 +1003,8 @@ mod tests {
         let creds = chatgpt_credentials(home.path()).unwrap();
         assert_eq!(creds.access_token, "access");
         assert_eq!(creds.account_id, "acct");
+        let (_, override_headers) = request_credentials(home.path()).unwrap();
+        assert!(!override_headers);
     }
 
     #[test]
@@ -1129,6 +1162,9 @@ mod tests {
         let creds = chatgpt_credentials(home.path()).unwrap();
         assert_eq!(creds.access_token, "kit-access");
         assert_eq!(creds.account_id, "kit");
+        let (request_creds, override_headers) = request_credentials(home.path()).unwrap();
+        assert!(override_headers);
+        assert_eq!(request_creds.account_id, "kit");
         assert_eq!(login_status(home.path()).account_id.as_deref(), Some("kit"));
 
         let mut headers = HeaderMap::new();
@@ -1136,8 +1172,15 @@ mod tests {
             http::header::AUTHORIZATION,
             HeaderValue::from_static("Bearer official-access"),
         );
+        headers.insert(
+            HeaderName::from_static("chatgpt-account-id"),
+            HeaderValue::from_static("kit"),
+        );
         headers.insert(http::header::COOKIE, HeaderValue::from_static("session=old"));
+        // Matching one identity field is insufficient when another explicitly conflicts.
+        assert!(!credentials_match_headers(&headers, &request_creds));
         apply_kit_auth_headers(&mut headers, home.path());
+        assert!(credentials_match_headers(&headers, &request_creds));
         assert_eq!(
             headers.get(http::header::AUTHORIZATION).unwrap(),
             "Bearer kit-access"

@@ -10,9 +10,9 @@ use crate::settings::{home_dir, Settings};
 
 pub const PROVIDER_ID: &str = "codex_state_kit";
 const OFFICIAL_DEFAULT_MODEL: &str = "gpt-6-astra";
-const MODEL_OVERLAY_VERSION: u32 = 2;
+const MODEL_OVERLAY_VERSION: u32 = 3;
 const LAST_SELECTED_ATOM: &str = "chatgpt-last-selected-model-v1";
-const MODEL_OVERLAY_KEYS: &[&str] = &[
+const MODEL_SNAPSHOT_KEYS: &[&str] = &[
     "model",
     "model_reasoning_effort",
     "model_reasoning_summary",
@@ -22,6 +22,16 @@ const MODEL_OVERLAY_KEYS: &[&str] = &[
     "review_model",
     "model_catalog_json",
 ];
+const MODEL_OVERLAY_KEYS: &[&str] = &[
+    "model",
+    "model_reasoning_effort",
+    "model_reasoning_summary",
+    "model_verbosity",
+    "plan_mode_reasoning_effort",
+    "review_model",
+    "model_catalog_json",
+];
+const PRESERVED_MODEL_KEYS: &[&str] = &["service_tier"];
 const CUSTOM_MODEL_CATALOGS: &[&str] = &["cc-switch-model-catalog.json"];
 const KIT_MODEL_CATALOG: &str = "codex-state-kit-model-catalog.json";
 const OFFICIAL_MODELS_CACHE: &str = "models_cache.json";
@@ -267,17 +277,24 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
     let current = openai_base_url(&doc);
     let legacy = has_legacy_fwd(&doc);
     let already = live_attached(&raw, &next)?;
+    let previous_backup = load_backup_at(backup_file);
+    let overlay_version = previous_backup
+        .as_ref()
+        .map(|item| item.model_overlay_version)
+        .unwrap_or(0);
     if already && current.as_deref() == Some(next.as_str()) && !legacy {
-        let overlay_version = load_backup_at(backup_file)
-            .map(|item| item.model_overlay_version)
-            .unwrap_or(0);
+        let needs_overlay_migration = overlay_version < MODEL_OVERLAY_VERSION
+            && (leftover_model_overlay_present(&raw)?
+                || preserved_model_key_recovery_needed(&raw, previous_backup.as_ref())?);
         ensure_sidecar(home, backup_file, &raw, false)?;
         refresh_model_snapshot(backup_file, &raw)?;
         apply_model_surface(home, backup_file)?;
-        if (overlay_version < MODEL_OVERLAY_VERSION && leftover_model_overlay_present(&raw)?)
-            || !kit_catalog_pointer_ok(home, &raw)?
-        {
+        if needs_overlay_migration || !kit_catalog_pointer_ok(home, &raw)? {
             let mut patched = apply_fwd_route(&raw, &next)?;
+            if needs_overlay_migration {
+                patched =
+                    recover_preserved_model_keys(&patched, load_backup_at(backup_file).as_ref())?;
+            }
             patched = with_kit_catalog_pointer(home, &patched)?;
             atomic_write_text(&config_path, &patched)?;
         }
@@ -292,6 +309,9 @@ fn attach_at(home: &Path, backup_file: &Path, next: &str) -> Result<String> {
     refresh_model_snapshot(backup_file, &raw)?;
     apply_model_surface(home, backup_file)?;
     let mut patched = apply_fwd_route(&raw, &next)?;
+    if overlay_version < MODEL_OVERLAY_VERSION {
+        patched = recover_preserved_model_keys(&patched, load_backup_at(backup_file).as_ref())?;
+    }
     patched = with_kit_catalog_pointer(home, &patched)?;
     atomic_write_text(&config_path, &patched)?;
     overlay_kit_onto_official(home)?;
@@ -408,7 +428,7 @@ fn fill_model_snapshot(backup: &mut Backup, doc: &DocumentMut) {
             },
         );
     }
-    for key in MODEL_OVERLAY_KEYS {
+    for key in MODEL_SNAPSHOT_KEYS {
         backup
             .previous_model_keys
             .entry((*key).to_string())
@@ -434,7 +454,7 @@ fn apply_fwd_route(config_text: &str, proxy_base_url: &str) -> Result<String> {
     doc["openai_base_url"] = toml_edit::value(normalize_base_url(proxy_base_url));
     doc["cli_auth_credentials_store"] = toml_edit::value("file");
     for key in MODEL_OVERLAY_KEYS {
-        doc.as_table_mut().remove(*key);
+        doc.as_table_mut().remove(key);
     }
     if let Some(id) = active_model_provider(&doc) {
         if id != "openai" {
@@ -442,6 +462,33 @@ fn apply_fwd_route(config_text: &str, proxy_base_url: &str) -> Result<String> {
         }
     }
     strip_legacy_fwd(&mut doc);
+    Ok(doc.to_string())
+}
+
+fn recover_preserved_model_keys(config_text: &str, backup: Option<&Backup>) -> Result<String> {
+    let Some(backup) = backup else {
+        return Ok(config_text.to_string());
+    };
+    let mut doc = parse_doc(config_text)?;
+    for key in PRESERVED_MODEL_KEYS {
+        if doc.get(key).is_some() {
+            continue;
+        }
+        let Some(snapshot) = backup.previous_model_keys.get(*key) else {
+            continue;
+        };
+        if !snapshot.present {
+            continue;
+        }
+        if let Some(value) = snapshot
+            .value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            doc[*key] = toml_edit::value(value);
+        }
+    }
     Ok(doc.to_string())
 }
 
@@ -493,11 +540,28 @@ fn leftover_model_overlay_present(raw: &str) -> Result<bool> {
             }
             continue;
         }
-        if doc.get(*key).is_some() {
+        if doc.get(key).is_some() {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn preserved_model_key_recovery_needed(raw: &str, backup: Option<&Backup>) -> Result<bool> {
+    let Some(backup) = backup else {
+        return Ok(false);
+    };
+    let doc = parse_doc(raw)?;
+    Ok(PRESERVED_MODEL_KEYS.iter().any(|key| {
+        doc.get(key).is_none()
+            && backup.previous_model_keys.get(*key).is_some_and(|snapshot| {
+                snapshot.present
+                    && snapshot
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty())
+            })
+    }))
 }
 
 fn kit_catalog_pointer_ok(home: &Path, raw: &str) -> Result<bool> {
@@ -1547,7 +1611,7 @@ model_catalog_json = "cc-switch-model-catalog.json"
         let patched = fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(!patched.contains("grok-4.6"));
         assert!(!patched.contains("model_reasoning_effort"));
-        assert!(!patched.contains("service_tier"));
+        assert!(patched.contains("service_tier = \"priority\""));
         assert!(patched.contains(&format!("model_catalog_json = \"{KIT_MODEL_CATALOG}\"")));
         assert!(!home.join("cc-switch-model-catalog.json").exists());
         assert!(home
@@ -1592,7 +1656,7 @@ model_catalog_json = "cc-switch-model-catalog.json"
     }
 
     #[test]
-    fn apply_fwd_route_strips_local_model_overrides() {
+    fn apply_fwd_route_strips_local_model_overrides_but_preserves_service_tier() {
         let raw = r#"model = "grok-4.6"
 model_reasoning_effort = "xhigh"
 service_tier = "priority"
@@ -1602,7 +1666,36 @@ model_provider = "cc-switch"
         assert!(out.contains("openai_base_url = \"http://127.0.0.1:8787\""));
         assert!(!out.contains("grok-4.6"));
         assert!(!out.contains("model_reasoning_effort"));
-        assert!(!out.contains("service_tier"));
+        assert!(out.contains("service_tier = \"priority\""));
         assert!(!out.contains("model_provider"));
+    }
+
+    #[test]
+    fn reattach_recovers_service_tier_removed_by_previous_overlay() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("codex");
+        let backup = root.path().join("backup.json");
+        write_config(
+            &home,
+            "model = \"gpt-6-astra\"\nservice_tier = \"priority\"\n",
+        );
+        write_chatgpt_auth(&home);
+        attach_at(&home, &backup, "http://127.0.0.1:8787").unwrap();
+
+        let mut sidecar: Backup =
+            serde_json::from_str(&fs::read_to_string(&backup).unwrap()).unwrap();
+        sidecar.model_overlay_version = 2;
+        fs::write(&backup, serde_json::to_string_pretty(&sidecar).unwrap()).unwrap();
+        let mut raw = fs::read_to_string(home.join("config.toml")).unwrap();
+        raw = raw.replace("service_tier = \"priority\"\n", "");
+        fs::write(home.join("config.toml"), raw).unwrap();
+
+        attach_at(&home, &backup, "http://127.0.0.1:8787").unwrap();
+        let patched = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(patched.contains("service_tier = \"priority\""));
+
+        restore_at(&backup, &home).unwrap();
+        let restored = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(restored.contains("service_tier = \"priority\""));
     }
 }

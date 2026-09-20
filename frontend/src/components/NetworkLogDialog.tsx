@@ -82,6 +82,7 @@ function stateLabel(entry: LogEntry): string {
     case "replaced": return `已替换${length}`;
     case "initial_request": return "首请求未携带";
     case "preserved_no_ticket": return `沿用客户端值${length}`;
+    case "preserved_account_mismatch": return `账号变化，沿用客户端值${length}`;
     case "preserved_unknown_model": return `模型未知，沿用${length}`;
     case "captured": return "已采集入池";
     case "received": return "已收到候选 state";
@@ -123,16 +124,45 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(ms < 10_000 ? 1 : 0)} 秒`;
+  const minutes = Math.floor(ms / 60_000);
+  const seconds = Math.floor((ms % 60_000) / 1000);
+  return `${minutes} 分 ${seconds} 秒`;
+}
+
+function streamLabel(entry: LogEntry): string | null {
+  const metrics = entry.streamChunks
+    ? `${entry.streamChunks} 块 · ${formatBytes(entry.streamBytes)}${entry.maxIdleMs != null ? ` · 最大静默 ${formatDuration(entry.maxIdleMs)}` : ""}`
+    : null;
+  switch (entry.streamState) {
+    case "awaiting_first_chunk":
+      return `已收到响应头 · 等待首块${entry.currentIdleMs != null ? ` · 当前静默 ${formatDuration(entry.currentIdleMs)}` : ""}`;
+    case "streaming":
+      return `流传输中${entry.currentIdleMs != null ? ` · 当前静默 ${formatDuration(entry.currentIdleMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
+    case "completed":
+      return `流已完成${entry.streamTotalMs != null ? ` · 总计 ${formatDuration(entry.streamTotalMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
+    case "error":
+      return `流读取错误${entry.streamTotalMs != null ? ` · ${formatDuration(entry.streamTotalMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
+    case "cancelled":
+      return `下游已取消${entry.streamTotalMs != null ? ` · ${formatDuration(entry.streamTotalMs)}` : ""}${metrics ? ` · ${metrics}` : ""}`;
+    default:
+      return null;
+  }
+}
+
 function logExport(status: Status): string {
   const routeLines = [
     `Token 获取: ${ticketRoute(status).join(" -> ")}`,
     `业务请求: ${businessRoute(status).join(" -> ")}`,
   ];
   const entries = status.logs.map((entry) => [
-    `[${entry.ts}] ${requestLabel(entry)} -> ${entry.status} (${entry.ms}ms)`,
+    `[${entry.ts}] ${requestLabel(entry)} -> ${entry.status} (response_header=${entry.responseHeaderMs ?? entry.ms}ms)`,
     `  model=${entry.model || "unknown"} transport=${transportLabel(entry.transport)} route=${routeLabel(entry)}`,
     `  peer=${entry.peerAddr || "unknown"} final=${entry.finalOrigin || "unknown"} http=${entry.httpVersion || "unknown"}`,
     `  state=${stateLabel(entry)} returnedState=${entry.returnedTurnStateLen || 0} body=${formatBytes(entry.bodyBytes)} encoding=${entry.contentEncoding || "none"} error=${entry.errorKind || "none"}`,
+    `  stream_state=${entry.streamState || "not_tracked"} first_chunk_ms=${entry.firstChunkMs ?? "none"} last_chunk_ms=${entry.lastChunkMs ?? "none"} total_ms=${entry.streamTotalMs ?? "none"} chunks=${entry.streamChunks || 0} bytes=${entry.streamBytes || 0} max_idle_ms=${entry.maxIdleMs ?? "none"} current_idle_ms=${entry.currentIdleMs ?? "none"}`,
   ].join("\n"));
   return [...routeLines, "", ...entries].join("\n");
 }
@@ -257,7 +287,8 @@ export function NetworkLogDialog({ open, status, triggerRef, onClose }: NetworkL
                     </td>
                     <td>
                       <span className={`network-log-status${entry.status >= 400 ? " network-log-status--error" : ""}`}>{entry.status}</span>
-                      <small>{entry.httpVersion || "HTTP"} · 响应头 {entry.ms} ms{entry.errorKind ? ` · ${entry.errorKind}` : ""}</small>
+                      <small>{entry.httpVersion || "HTTP"} · 响应头 {entry.responseHeaderMs ?? entry.ms} ms{entry.errorKind ? ` · ${entry.errorKind}` : ""}</small>
+                      {streamLabel(entry) ? <small>{streamLabel(entry)}</small> : null}
                     </td>
                   </tr>
                 ))}

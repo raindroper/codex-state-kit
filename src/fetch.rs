@@ -18,6 +18,8 @@ pub const CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// 单发未命中目标长度后的重试间隔
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(6);
 pub const ERROR_BACKOFF: Duration = Duration::from_secs(30);
+/// A 403 can be tied to one model or one rotating exit rather than invalid login.
+pub const FORBIDDEN_BACKOFF: Duration = Duration::from_secs(30);
 pub const AUTH_BACKOFF: Duration = Duration::from_secs(300);
 pub const CONNECT_ATTEMPTS: usize = 4;
 pub const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(6);

@@ -38,6 +38,29 @@ async fn streaming_proxy() -> (
     (url, headers_rx, finish_tx, task)
 }
 
+async fn fixed_response_proxy(
+    status: &str,
+    content_type: &str,
+    body: &'static [u8],
+) -> (String, oneshot::Receiver<String>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (headers_tx, headers_rx) = oneshot::channel();
+    let status = status.to_string();
+    let content_type = content_type.to_string();
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        headers_tx.send(read_headers(&mut socket).await).unwrap();
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(body).await.unwrap();
+    });
+    (url, headers_rx, task)
+}
+
 fn patch(settings: &Settings, proxy: &str) -> SettingsPatch {
     SettingsPatch {
         proxy_listen: settings.proxy_listen.clone(),
@@ -116,6 +139,7 @@ async fn upstream_proxy_hot_update_and_failures() {
                 .body(Body::empty())
                 .unwrap(),
             &mut route_details,
+            Instant::now(),
         )
         .await
         .unwrap();
@@ -139,6 +163,11 @@ async fn upstream_proxy_hot_update_and_failures() {
         use futures_util::StreamExt;
         let mut stream = response.into_body().into_data_stream();
         assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"data: 1\n\n");
+        let lifecycle = route_details.stream_lifecycle.clone().unwrap();
+        let active = lifecycle.snapshot();
+        assert_eq!(active.state, "streaming");
+        assert_eq!(active.stream_chunks, 1);
+        assert_eq!(active.stream_bytes, 9);
 
         let (second, second_headers, finish_second, second_task) = streaming_proxy().await;
         handle
@@ -181,6 +210,10 @@ async fn upstream_proxy_hot_update_and_failures() {
         finish_first.send(()).unwrap();
         assert_eq!(&stream.next().await.unwrap().unwrap()[..], b"data: 2\n\n");
         assert!(stream.next().await.is_none());
+        let completed = lifecycle.snapshot();
+        assert_eq!(completed.state, "completed");
+        assert_eq!(completed.stream_chunks, 2);
+        assert_eq!(completed.stream_bytes, 18);
         first_task.await.unwrap();
         second_task.await.unwrap();
 
@@ -277,6 +310,46 @@ async fn upstream_proxy_https_connect_uses_proxy_auth_then_tls() {
             .send()
             .await
             .is_err());
+        task.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn json_error_response_is_not_reported_as_sse() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let home = tempfile::tempdir().unwrap();
+        let (proxy, headers, task) =
+            fixed_response_proxy("400 Bad Request", "application/json", b"{}").await;
+        let app = App::new(Settings {
+            upstream: "http://upstream.invalid".into(),
+            upstream_proxy: proxy,
+            codex_home: home.path().display().to_string(),
+            ..Settings::default()
+        })
+        .unwrap();
+        let mut details = NetworkLogDetails::default();
+        let response = forward_http_with_log(
+            &app,
+            Request::builder()
+                .uri("/responses")
+                .header("accept", "text/event-stream")
+                .body(Body::empty())
+                .unwrap(),
+            &mut details,
+            Instant::now(),
+        )
+        .await
+        .unwrap();
+        assert!(headers.await.unwrap().contains("http://upstream.invalid/responses"));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(details.transport, "http");
+        assert!(details.stream_lifecycle.is_none());
+        assert_eq!(
+            &axum::body::to_bytes(response.into_body(), 16).await.unwrap()[..],
+            b"{}"
+        );
         task.await.unwrap();
     })
     .await

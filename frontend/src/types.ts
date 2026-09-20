@@ -4,7 +4,9 @@ export interface LogEntry {
   method: string;
   path: string;
   status: number;
+  /** Compatibility alias for responseHeaderMs. */
   ms: number;
+  responseHeaderMs: number;
   flow: string;
   transport: string;
   targetOrigin: string;
@@ -20,6 +22,14 @@ export interface LogEntry {
   turnStateLen?: number | null;
   returnedTurnStateLen?: number | null;
   errorKind?: string | null;
+  streamState: "not_tracked" | "awaiting_first_chunk" | "streaming" | "completed" | "error" | "cancelled" | string;
+  firstChunkMs?: number | null;
+  lastChunkMs?: number | null;
+  streamTotalMs?: number | null;
+  streamBytes: number;
+  streamChunks: number;
+  maxIdleMs?: number | null;
+  currentIdleMs?: number | null;
 }
 
 export interface TokenLenCount {
